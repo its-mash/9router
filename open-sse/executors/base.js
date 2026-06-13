@@ -2,6 +2,7 @@ import { HTTP_STATUS, RETRY_CONFIG, DEFAULT_RETRY_CONFIG, resolveRetryEntry, FET
 import { shouldRefreshCredentials } from "../services/oauthCredentialManager.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { dbg } from "../utils/debugLog.js";
+import { INTERNAL_REQUEST_HEADER } from "../config/appConstants.js";
 
 /**
  * BaseExecutor - Base class for provider executors
@@ -118,6 +119,11 @@ export class BaseExecutor {
       const url = this.buildUrl(model, stream, urlIndex, credentials);
       const transformedBody = this.transformRequest(model, body, stream, credentials);
       const headers = this.buildHeaders(credentials, stream);
+      // MITM bypass: tag every 9Router-originated upstream call so an active TLS-MITM
+      // (e.g. api.anthropic.com → 127.0.0.1) passes it straight through to the real
+      // upstream instead of re-routing it into the combo → prevents an infinite loop
+      // when a combo contains a model whose provider host is being MITM-intercepted.
+      headers[INTERNAL_REQUEST_HEADER.name] = INTERNAL_REQUEST_HEADER.value;
 
       if (!retryAttemptsByUrl[urlIndex]) retryAttemptsByUrl[urlIndex] = 0;
 

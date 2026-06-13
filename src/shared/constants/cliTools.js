@@ -66,6 +66,24 @@ export const MITM_TOOLS = {
       { id: "simple-task", name: "Qwen3 Coder Next", alias: "simple-task" },
     ],
   },
+  // Key MUST be "anthropic" — it's the single tool identifier shared across the
+  // MITM config (getToolForHost / URL_PATTERNS / MODEL_PATTERNS / handlers),
+  // TOOL_HOSTS (DNS), and the mitmAlias store. The UI card + alias API key off it.
+  anthropic: {
+    id: "anthropic",
+    name: "Claude Code",
+    image: "/providers/claude.png",
+    color: "#D97757",
+    description: "Claude Code CLI via TLS-MITM on api.anthropic.com. Native Claude models pass through untouched — pure Anthropic (your token, your limits, no fallback). Your 9Router combos appear in Claude Code's model list as 9r/<combo> (fallback + web search/fetch). Pick which backend fulfills web search & fetch below.",
+    configType: "mitm",
+    mitmDomain: "api.anthropic.com",
+    // No tier→combo mapping. Native ids pass straight through to the real Anthropic API;
+    // combos are exposed to Claude Code as "9r/<combo>" (the MITM enriches GET /v1/models),
+    // and a 9r/<combo> request runs the combo (fallback + web_search/web_fetch shim). The
+    // only per-tool config is which combo/provider the shim uses for search & fetch.
+    usesSearchCombo: true,
+    defaultModels: [],
+  },
   // cursor: {
   //   id: "cursor",
   //   name: "Cursor",

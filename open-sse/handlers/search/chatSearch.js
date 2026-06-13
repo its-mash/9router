@@ -42,6 +42,75 @@ function normalizeCitation(c) {
  * { endpoint, defaultModel, buildBody, buildHeaders, extractAnswer }
  */
 const CHAT_SEARCH_CONFIG = {
+  // Anthropic (Claude) as a search wrapper — a cheap Haiku call with the native
+  // server-side web_search tool. Key is "anthropic" to match the provider catalog
+  // id (providers.js) that index.js passes as `provider`. Highest-quality fulfiller
+  // for the web_search shim AND a standalone /v1/search backend. Credentials: an
+  // Anthropic OAuth token (sk-ant-oat*) → Bearer + oauth beta, or an x-api-key.
+  anthropic: {
+    endpoint: () => "https://api.anthropic.com/v1/messages",
+    defaultModel: "claude-haiku-4-5",
+    buildBody: (query, model) => ({
+      model,
+      max_tokens: 1024,
+      // Optimized + cache-friendly: a STABLE system + tools prefix that is byte-identical
+      // across every search query, with a cache_control breakpoint at the end of that prefix.
+      // Only the user message (the query) changes, so Anthropic prompt-caching can serve the
+      // tools+system prefix as cache_read on subsequent searches (when the prefix is large
+      // enough to be cache-eligible). Keeps each search a clean single-turn call.
+      system: [
+        {
+          type: "text",
+          text: "You are a precise web search assistant. For the user's query, call the web_search tool to gather current authoritative sources, then answer concisely and cite the source URLs. Prefer official / primary sources.",
+          cache_control: { type: "ephemeral" }
+        }
+      ],
+      messages: [{ role: "user", content: query }],
+      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }]
+    }),
+    buildHeaders: (token) => {
+      const isOAuth = typeof token === "string" && token.startsWith("sk-ant-oat");
+      const betas = ["web-search-2025-03-05"]; // harmless if web_search is GA; required while beta
+      if (isOAuth) betas.push("oauth-2025-04-20");
+      return {
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": betas.join(","),
+        // MITM bypass: when api.anthropic.com is hosts-redirected into the 9Router MITM,
+        // this header makes the MITM pass our own search call straight through to the real
+        // API instead of re-routing it (so Claude works as a search provider under MITM).
+        "x-request-source": "local",
+        ...(isOAuth ? { Authorization: `Bearer ${token}` } : { "x-api-key": token })
+      };
+    },
+    extractAnswer: (data) => {
+      // Anthropic Messages response: content[] holds text blocks (with citations) +
+      // web_search_tool_result blocks (each .content[] = web_search_result items).
+      const content = Array.isArray(data?.content) ? data.content : [];
+      let text = "";
+      const citations = [];
+      const seen = new Set();
+      const push = (url, title, snippet) => {
+        if (!url || seen.has(url)) return;
+        seen.add(url);
+        citations.push({ url, title: title || "", snippet: snippet || "" });
+      };
+      for (const block of content) {
+        if (block?.type === "text") {
+          text += block.text || "";
+          for (const c of block.citations || []) push(c?.url, c?.title, c?.cited_text);
+        } else if (block?.type === "web_search_tool_result") {
+          const items = Array.isArray(block.content) ? block.content : [];
+          for (const it of items) {
+            if (it?.type === "web_search_result") push(it.url, it.title, null);
+          }
+        }
+      }
+      const tokens = (data?.usage?.input_tokens || 0) + (data?.usage?.output_tokens || 0);
+      return { text, citations, tokens };
+    }
+  },
+
   gemini: {
     endpoint: (model) =>
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
@@ -277,6 +346,11 @@ const CHAT_SEARCH_CONFIG = {
   }
 };
 
+// Claude Code OAuth connections are stored under provider id "claude" (not "anthropic").
+// Alias the chat-search config so the connected Claude subscription works as a Haiku-based
+// web_search backend (selectable in the dashboard + addable to a webSearch combo).
+CHAT_SEARCH_CONFIG.claude = CHAT_SEARCH_CONFIG.anthropic;
+
 /**
  * Execute a chat-search request against the chosen provider.
  * @param {object} params
@@ -386,6 +460,7 @@ export async function handleChatSearch({
   const retrievedAt = new Date().toISOString();
   const limited = (citations || []).slice(0, limit);
   const results = limited.map((c, i) => toResult(c, i, provider, retrievedAt));
+  const rawUsage = (data && data.usage) || {};
 
   return {
     success: true,
@@ -395,7 +470,16 @@ export async function handleChatSearch({
       query,
       results,
       answer: { source: provider, text: text || "", model: useModel },
-      usage: { queries_used: 1, search_cost_usd: 0, llm_tokens: tokens || 0 },
+      // The exact body sent upstream — so the usage tab's request-details show it (and the
+      // cache_control / cache token fields, to confirm caching).
+      providerRequest: body,
+      usage: {
+        queries_used: 1, search_cost_usd: 0, llm_tokens: tokens || 0,
+        input_tokens: rawUsage.input_tokens ?? rawUsage.prompt_tokens,
+        output_tokens: rawUsage.output_tokens ?? rawUsage.completion_tokens,
+        cache_read_input_tokens: rawUsage.cache_read_input_tokens,
+        cache_creation_input_tokens: rawUsage.cache_creation_input_tokens
+      },
       metrics: {
         response_time_ms: Date.now() - startTime,
         upstream_latency_ms: upstreamLatency,

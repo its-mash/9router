@@ -9,7 +9,9 @@
     "start": "next start",
     "dev:bun": "bun --bun next dev --webpack --port 20128",
     "build:bun": "bun --bun next build --webpack",
-    "start:bun": "bun ./.next/standalone/server.js"
+    "start:bun": "bun ./.next/standalone/server.js",
+    "build:cli": "node scripts/buildAndInstall.cjs --build",
+    "build:install": "node scripts/buildAndInstall.cjs"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

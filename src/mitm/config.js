@@ -19,6 +19,7 @@ const TARGET_HOSTS = [
   "api.individual.githubcopilot.com",
   "q.us-east-1.amazonaws.com",
   "api2.cursor.sh",
+  "api.anthropic.com",
 ];
 
 const URL_PATTERNS = {
@@ -26,6 +27,7 @@ const URL_PATTERNS = {
   copilot: ["/chat/completions", "/v1/messages", "/responses"],
   kiro: ["/generateAssistantResponse"],
   cursor: ["/BidiAppend", "/RunSSE", "/RunPoll", "/Run"],
+  anthropic: ["/v1/messages"],
 };
 
 // Synonym map: rawModel from request → canonical alias key in mitmAlias DB
@@ -54,6 +56,16 @@ const MODEL_PATTERNS = {
     { match: /sonnet|claude/i,                                     alias: "claude-sonnet-4-6" },
     { match: /gpt.*oss|oss/i,                                      alias: "gpt-oss-120b-medium" },
   ],
+  // Claude Code sends real Anthropic model ids (claude-opus-4-8, claude-sonnet-4-6,
+  // claude-haiku-4-5, plus dated/bedrock/vertex variants). Map each TIER → an alias key
+  // the user binds to a combo in the dashboard (Phase 2). Order: opus/haiku before the
+  // broad sonnet/claude catch-all. If no alias is configured, getMappedModel returns null
+  // → the request passes through to the REAL Anthropic API unchanged (safe default).
+  anthropic: [
+    { match: /opus/i,            alias: "claude-opus" },
+    { match: /haiku/i,           alias: "claude-haiku" },
+    { match: /sonnet|claude/i,   alias: "claude-sonnet" },
+  ],
 };
 
 // Models that must NEVER be re-routed — always passthrough to the real upstream, even when
@@ -81,6 +93,7 @@ function getToolForHost(host) {
   if (h === "daily-cloudcode-pa.googleapis.com" || h === "cloudcode-pa.googleapis.com") return "antigravity";
   if (h === "q.us-east-1.amazonaws.com") return "kiro";
   if (h === "api2.cursor.sh") return "cursor";
+  if (h === "api.anthropic.com") return "anthropic";
   return null;
 }
 

@@ -11,6 +11,9 @@ import { cacheClaudeHeaders } from "open-sse/utils/claudeHeaderCache.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
+import { runWebSearchShim, requestWantsServerTool, isAnthropicNative } from "open-sse/handlers/webSearchShim.js";
+import { runSearchQuery } from "./search.js";
+import { runFetchQuery } from "./fetch.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { handleComboChat } from "open-sse/services/combo.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
@@ -200,7 +203,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     // Use shared chatCore
     const chatSettings = await getSettings();
     const providerThinking = (chatSettings.providerThinking || {})[provider] || null;
-    const result = await handleChatCore({
+    const coreArgs = {
       body: { ...body, model: `${provider}/${model}` },
       modelInfo: { provider, model },
       credentials: refreshedCredentials,
@@ -226,7 +229,24 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       onRequestSuccess: async () => {
         await clearAccountError(credentials.connectionId, credentials, model);
       }
-    });
+    };
+
+    // Web-search shim: Claude Code asks for server-side web_search, but the resolved
+    // model isn't Anthropic-native → fulfill the search ourselves (response-driven loop)
+    // and synthesize native-looking search blocks. Anthropic-native models pass straight
+    // through (their server-side search just works). See open-sse/handlers/webSearchShim.js.
+    let result;
+    if (requestWantsServerTool(body) && !isAnthropicNative(provider)) {
+      log.info("CHAT", `[server-tool shim] non-native ${provider}/${model} — fulfilling web_search/web_fetch`);
+      // Fulfill via the real dispatch (user's webSearch combo: gemini → exa; webFetch combo: exa).
+      const search = (q) => runSearchQuery(q, { maxResults: 8, log });
+      const fetchUrl = (u) => runFetchQuery(u, { maxCharacters: 8000, log });
+      const callModel = (messages, stream, tools) =>
+        handleChatCore({ ...coreArgs, body: { ...coreArgs.body, messages, stream, tools: tools ?? coreArgs.body.tools } });
+      result = await runWebSearchShim({ body: coreArgs.body, callModel, search, fetch: fetchUrl, log });
+    } else {
+      result = await handleChatCore(coreArgs);
+    }
 
     if (result.success) return result.response;
 

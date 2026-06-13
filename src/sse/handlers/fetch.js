@@ -13,6 +13,72 @@ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo.js";
+import { buildRequestDetail } from "open-sse/handlers/chatCore/requestDetail.js";
+import { saveRequestDetail, appendRequestLog } from "@/lib/usageDb.js";
+
+/**
+ * Record a successful web-fetch into the usage + request-details store (so it shows in the usage tab).
+ */
+function recordFetchUsage({ providerId, data, connectionId }) {
+  try {
+    if (!data) return;
+    const tokens = { prompt_tokens: 0, completion_tokens: 0 };
+    saveRequestDetail(buildRequestDetail({
+      provider: providerId, model: providerId, connectionId, tokens,
+      request: { url: data.url, provider: providerId, format: data.content?.format },
+      providerResponse: { title: data.title, length: data.content?.length },
+      response: { content: `fetched ${data.content?.length ?? 0} chars from ${data.url || ""}`, finish_reason: "stop" },
+      status: "success",
+    }, { endpoint: "/v1/fetch" })).catch(() => {});
+    appendRequestLog({ provider: providerId, model: providerId, connectionId, tokens, status: "200 OK" }).catch(() => {});
+  } catch { /* never break fetch */ }
+}
+
+/**
+ * Internal fulfiller for the Claude-Code web_fetch shim (open-sse/handlers/webSearchShim.js).
+ * Mirrors runSearchQuery: picks the user's webFetch combo (e.g. "fetch-combo": exa), else
+ * settings.mitmFetchCombo, else a single "exa" provider, and returns the fetched page text.
+ *
+ * @param {string} url
+ * @param {{format?:string, maxCharacters?:number, log?:object}} [opts]
+ */
+export async function runFetchQuery(url, { format = "markdown", maxCharacters = 8000, log: logger, target: explicitTarget } = {}) {
+  if (!url || typeof url !== "string") return { ok: false };
+  let target = "exa";
+  if (explicitTarget && String(explicitTarget).trim()) {
+    target = String(explicitTarget).trim();
+  } else {
+    try {
+      const settings = await getSettings();
+      const chosen = settings?.mitmFetchCombo && String(settings.mitmFetchCombo).trim();
+      if (chosen) {
+        target = chosen;
+      } else {
+        const combos = await getCombos();
+        const wf = (combos || []).find((c) => c && c.kind === "webFetch" && Array.isArray(c.models) && c.models.length);
+        if (wf?.name) target = wf.name;
+      }
+    } catch { /* use fallback */ }
+  }
+
+  const req = new Request("http://localhost/v1/fetch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: target, url, format, max_characters: maxCharacters }),
+  });
+  try {
+    const resp = await handleFetch(req);
+    const data = await resp.json().catch(() => null);
+    if (data && (data.content?.text != null || data.url)) {
+      logger?.info?.("FETCH", `[web-fetch shim] backend=${target} url=${url}`);
+      return { ok: true, url: data.url || url, title: data.title || "", text: data.content?.text || "" };
+    }
+    return { ok: false, url };
+  } catch (e) {
+    logger?.warn?.("FETCH", `[web-fetch shim] failed: ${e?.message}`);
+    return { ok: false, url };
+  }
+}
 
 /**
  * Handle web fetch (URL extraction) request for the SSE/Next.js server.
@@ -137,6 +203,7 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
       log
     });
     if (result.success) {
+      recordFetchUsage({ providerId, data: result.data, connectionId: null });
       return new Response(JSON.stringify(result.data), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
@@ -193,6 +260,7 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
     });
 
     if (result.success) {
+      recordFetchUsage({ providerId, data: result.data, connectionId: credentials.connectionId });
       return new Response(JSON.stringify(result.data), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });

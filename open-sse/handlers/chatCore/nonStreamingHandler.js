@@ -8,6 +8,7 @@ import { parseSSEToOpenAIResponse } from "./sseToJsonHandler.js";
 import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, saveUsageStats } from "./requestDetail.js";
 import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { decloakToolNames } from "../../utils/claudeCloaking.js";
+import { openaiToClaudeMessage } from "./claudeResponseUtil.js";
 
 /**
  * Translate non-streaming response body from provider format → OpenAI format.
@@ -201,7 +202,21 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
     }
   }
 
-  reqLogger.logConvertedResponse(translatedResponse);
+  // Claude-source clients (/v1/messages) require Anthropic Messages format, not the
+  // OpenAI chat.completion the steps above produce. Convert it back (or, for a
+  // claude→claude passthrough, strip the OpenAI fields tacked on above).
+  let clientResponse = translatedResponse;
+  if (sourceFormat === FORMATS.CLAUDE) {
+    if (Array.isArray(translatedResponse?.choices)) {
+      clientResponse = openaiToClaudeMessage(translatedResponse);
+    } else if (translatedResponse && (translatedResponse.type === "message" || Array.isArray(translatedResponse.content))) {
+      clientResponse = { ...translatedResponse };
+      delete clientResponse.object;
+      delete clientResponse.created;
+    }
+  }
+
+  reqLogger.logConvertedResponse(clientResponse);
 
   const totalLatency = Date.now() - requestStartTime;
   saveRequestDetail(buildRequestDetail({
@@ -223,7 +238,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
 
   return {
     success: true,
-    response: new Response(JSON.stringify(translatedResponse), {
+    response: new Response(JSON.stringify(clientResponse), {
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
     })
   };

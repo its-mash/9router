@@ -5,6 +5,10 @@ import { Card, Button, Badge, Input, ModelSelectModal } from "@/shared/component
 import { TOOL_HOSTS } from "@/shared/constants/mitmToolHosts";
 import Image from "next/image";
 
+// Built-in backends the web_search / web_fetch shim can use (in addition to user combos).
+const SEARCH_PROVIDERS = ["claude", "gemini", "anthropic", "exa", "perplexity", "tavily", "xai", "kimi", "minimax"];
+const FETCH_PROVIDERS = ["exa", "firecrawl", "jina-reader", "tavily"];
+
 /**
  * Per-tool MITM card — shows DNS status + model mappings.
  * - Auto-saves model mapping on blur or modal select
@@ -36,13 +40,38 @@ export default function MitmToolCard({
   const [modelMappings, setModelMappings] = useState({});
   const [modalOpen, setModalOpen] = useState(false);
   const [currentEditingAlias, setCurrentEditingAlias] = useState(null);
+  const [searchCombo, setSearchCombo] = useState("");
+  const [fetchCombo, setFetchCombo] = useState("");
+  const [mcpSearchCombo, setMcpSearchCombo] = useState("");
+  const [mcpFetchCombo, setMcpFetchCombo] = useState("");
+  const [mcpUrl, setMcpUrl] = useState("http://localhost:20128/v1/mcp");
+  const [comboList, setComboList] = useState([]);
 
   const mitmHosts = TOOL_HOSTS[tool.id] ?? [];
   const canRunWithoutPassword = isWin || hasCachedPassword || needsSudoPassword === false;
 
   useEffect(() => {
     if (isExpanded) loadSavedMappings();
+    if (isExpanded && tool.usesSearchCombo) loadSearchConfig();
   }, [isExpanded]);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") setMcpUrl(`${window.location.origin}/v1/mcp`);
+  }, []);
+
+  const loadSearchConfig = async () => {
+    try {
+      const [cRes, sRes] = await Promise.all([fetch("/api/combos"), fetch("/api/settings")]);
+      if (cRes.ok) { const d = await cRes.json(); setComboList(d.combos || []); }
+      if (sRes.ok) { const s = await sRes.json(); setSearchCombo(s.mitmSearchCombo || ""); setFetchCombo(s.mitmFetchCombo || ""); setMcpSearchCombo(s.mcpSearchCombo || ""); setMcpFetchCombo(s.mcpFetchCombo || ""); }
+    } catch { /* ignore */ }
+  };
+
+  const saveSearchSetting = async (patch) => {
+    try {
+      await fetch("/api/settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) });
+    } catch { /* ignore */ }
+  };
 
   const loadSavedMappings = async () => {
     try {
@@ -182,7 +211,7 @@ export default function MitmToolCard({
             {/* Info */}
             <div className="flex flex-col gap-0.5 text-[11px] text-text-muted px-1">
               <p>Toggle DNS to redirect {tool.name} traffic through 9Router via MITM.</p>
-              {!dnsActive && (
+              {!dnsActive && !tool.usesSearchCombo && (
                 <p className="text-amber-600 text-[10px] mt-1">
                   ⚠️ Enable DNS to edit model mappings
                 </p>
@@ -231,7 +260,102 @@ export default function MitmToolCard({
               </div>
             )}
 
-            {tool.defaultModels?.length === 0 && (
+            {/* Claude Code: no tier mapping — native passes through; combos are exposed as
+                9r/<combo>. Only config is which backend fulfills web search / fetch. */}
+            {tool.usesSearchCombo && (
+              <div className="flex flex-col gap-3">
+                <div className="rounded-md border border-border bg-surface/50 px-2.5 py-2 text-[11px] text-text-muted leading-relaxed">
+                  Native Claude models pass through untouched (pure Anthropic). Your combos appear in Claude Code as{" "}
+                  <code className="text-text-main">9r/&lt;combo&gt;</code> and run with fallback. Choose which backend fulfills
+                  server-side <b>web search</b> / <b>fetch</b> for routed (non-Anthropic) models:
+                </div>
+                <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-[9rem_1fr] sm:items-center sm:gap-2">
+                  <span className="text-xs font-semibold text-text-main sm:text-right">Web search</span>
+                  <select
+                    value={searchCombo}
+                    onChange={(e) => { setSearchCombo(e.target.value); saveSearchSetting({ mitmSearchCombo: e.target.value }); }}
+                    className="w-full px-2 py-2 bg-surface rounded border border-border text-xs focus:outline-none focus:ring-1 focus:ring-primary/50 sm:py-1.5"
+                  >
+                    <option value="">Auto (first webSearch combo)</option>
+                    <optgroup label="Combos">
+                      {comboList.filter((c) => c.kind === "webSearch").map((c) => (
+                        <option key={c.id} value={c.name}>{c.name}</option>
+                      ))}
+                    </optgroup>
+                    <optgroup label="Providers">
+                      {SEARCH_PROVIDERS.map((p) => (<option key={p} value={p}>{p}</option>))}
+                    </optgroup>
+                  </select>
+                </div>
+                <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-[9rem_1fr] sm:items-center sm:gap-2">
+                  <span className="text-xs font-semibold text-text-main sm:text-right">Web fetch</span>
+                  <select
+                    value={fetchCombo}
+                    onChange={(e) => { setFetchCombo(e.target.value); saveSearchSetting({ mitmFetchCombo: e.target.value }); }}
+                    className="w-full px-2 py-2 bg-surface rounded border border-border text-xs focus:outline-none focus:ring-1 focus:ring-primary/50 sm:py-1.5"
+                  >
+                    <option value="">Auto (first webFetch combo)</option>
+                    <optgroup label="Combos">
+                      {comboList.filter((c) => c.kind === "webFetch").map((c) => (
+                        <option key={c.id} value={c.name}>{c.name}</option>
+                      ))}
+                    </optgroup>
+                    <optgroup label="Providers">
+                      {FETCH_PROVIDERS.map((p) => (<option key={p} value={p}>{p}</option>))}
+                    </optgroup>
+                  </select>
+                </div>
+
+                {/* MCP search server — expose web_search/web_fetch as MCP tools any client can call */}
+                <div className="mt-1 flex flex-col gap-2 rounded-md border border-primary/20 bg-primary/5 px-2.5 py-2">
+                  <div className="flex items-center gap-1.5">
+                    <span className="material-symbols-outlined text-primary text-[16px]">hub</span>
+                    <span className="text-xs font-semibold text-text-main">Search MCP server</span>
+                    {serverRunning ? <Badge variant="success" size="sm">on</Badge> : <Badge variant="default" size="sm">server off</Badge>}
+                  </div>
+                  <p className="text-[11px] text-text-muted leading-relaxed">
+                    Connect any MCP client to 9Router search/fetch — model-agnostic, no native web_search needed. Add to Claude Code:
+                  </p>
+                  <code className="block break-all rounded border border-border bg-surface px-2 py-1 font-mono text-[10px] text-text-main">
+                    claude mcp add --transport http 9router-search {mcpUrl}
+                  </code>
+                  <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-[9rem_1fr] sm:items-center sm:gap-2">
+                    <span className="text-xs font-semibold text-text-main sm:text-right">MCP web search</span>
+                    <select
+                      value={mcpSearchCombo}
+                      onChange={(e) => { setMcpSearchCombo(e.target.value); saveSearchSetting({ mcpSearchCombo: e.target.value }); }}
+                      className="w-full px-2 py-2 bg-surface rounded border border-border text-xs focus:outline-none focus:ring-1 focus:ring-primary/50 sm:py-1.5"
+                    >
+                      <option value="">Auto (first combo)</option>
+                      <optgroup label="Combos">
+                        {comboList.map((c) => (<option key={c.id} value={c.name}>{c.name}{c.kind ? ` (${c.kind})` : ""}</option>))}
+                      </optgroup>
+                      <optgroup label="Providers">
+                        {SEARCH_PROVIDERS.map((p) => (<option key={p} value={p}>{p}</option>))}
+                      </optgroup>
+                    </select>
+                  </div>
+                  <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-[9rem_1fr] sm:items-center sm:gap-2">
+                    <span className="text-xs font-semibold text-text-main sm:text-right">MCP web fetch</span>
+                    <select
+                      value={mcpFetchCombo}
+                      onChange={(e) => { setMcpFetchCombo(e.target.value); saveSearchSetting({ mcpFetchCombo: e.target.value }); }}
+                      className="w-full px-2 py-2 bg-surface rounded border border-border text-xs focus:outline-none focus:ring-1 focus:ring-primary/50 sm:py-1.5"
+                    >
+                      <option value="">Auto (first webFetch combo)</option>
+                      <optgroup label="Combos">
+                        {comboList.filter((c) => c.kind === "webFetch").map((c) => (<option key={c.id} value={c.name}>{c.name}</option>))}
+                      </optgroup>
+                      <optgroup label="Providers">
+                        {FETCH_PROVIDERS.map((p) => (<option key={p} value={p}>{p}</option>))}
+                      </optgroup>
+                    </select>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {tool.defaultModels?.length === 0 && !tool.usesSearchCombo && (
               <p className="text-xs text-text-muted px-1">Model mappings will be available soon.</p>
             )}
 

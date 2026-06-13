@@ -31,6 +31,7 @@ const handlers = {
   copilot: require("./handlers/copilot"),
   kiro: require("./handlers/kiro"),
   cursor: require("./handlers/cursor"),
+  anthropic: require("./handlers/anthropic"),
 };
 
 // ── SSL / SNI ─────────────────────────────────────────────────
@@ -253,10 +254,13 @@ async function passthroughHttp2(req, res, bodyBuffer, headers, targetHost, onRes
       if (dumper) dumper.writeHeader(status, outHeaders);
 
       const chunks = [];
+      let h2ClientEnded = false;
+      req.on("close", () => { h2ClientEnded = true; });
       stream.on("data", chunk => {
+        if (h2ClientEnded) return;
         if (dumper) dumper.writeChunk(chunk);
         if (onResponse) chunks.push(chunk);
-        res.write(chunk);
+        try { res.write(chunk); } catch { h2ClientEnded = true; }
       });
       stream.on("end", () => {
         if (dumper) dumper.end();
@@ -280,6 +284,9 @@ async function passthroughHttp2(req, res, bodyBuffer, headers, targetHost, onRes
 // Fallback: raw https.request HTTP/1.1 with custom DNS (bypasses /etc/hosts MITM loop)
 async function passthroughHttps(req, res, bodyBuffer, headers, targetHost, onResponse, dumper) {
   const targetIP = await resolveTargetIP(targetHost);
+  let clientEnded = false;
+  req.on("close", () => { clientEnded = true; });
+
   const forwardReq = https.request({
     hostname: targetIP,
     port: 443,
@@ -299,13 +306,14 @@ async function passthroughHttps(req, res, bodyBuffer, headers, targetHost, onRes
 
     const chunks = [];
     forwardRes.on("data", chunk => {
+      if (clientEnded) return;
       if (dumper) dumper.writeChunk(chunk);
       if (onResponse) chunks.push(chunk);
-      res.write(chunk);
+      try { res.write(chunk); } catch { clientEnded = true; }
     });
     forwardRes.on("end", () => {
       if (dumper) dumper.end();
-      res.end();
+      if (!res.writableEnded) res.end();
       if (onResponse) try { onResponse(Buffer.concat(chunks), forwardRes.headers); } catch { /* ignore */ }
     });
   });
@@ -314,7 +322,7 @@ async function passthroughHttps(req, res, bodyBuffer, headers, targetHost, onRes
     err(`Passthrough error: ${e.message}`);
     if (dumper) { dumper.writeChunk(`\n[ERROR] ${e.message}\n`); dumper.end(); }
     if (!res.headersSent) res.writeHead(502);
-    res.end("Bad Gateway");
+    if (!res.writableEnded) res.end("Bad Gateway");
   });
 
   if (bodyBuffer.length > 0) forwardReq.write(bodyBuffer);
@@ -334,6 +342,23 @@ const server = https.createServer(sslOptions, async (req, res) => {
     const bodyBuffer = await collectBodyRaw(req);
     if (ENABLE_FILE_LOG) dumpRequest(req, bodyBuffer, "raw");
 
+    // [sniff] Observe every request to a MITM'd host so we can analyse exactly how the
+    // client (Claude Code) lists models, names models, and requests web_search/fetch.
+    try {
+      if (getToolForHost(req.headers.host) === "anthropic") {
+        const internal = req.headers[INTERNAL_REQUEST_HEADER.name] === INTERNAL_REQUEST_HEADER.value;
+        let extra = "";
+        if (!isBinaryData(bodyBuffer)) {
+          try {
+            const b = JSON.parse(bodyBuffer.toString());
+            const tools = Array.isArray(b?.tools) ? b.tools.map(t => t.type || t.name).join("+") : "-";
+            extra = ` | model=${b?.model ?? "-"} | stream=${b?.stream ?? "-"} | tools=${tools}`;
+          } catch { /* non-JSON / empty */ }
+        }
+        log(`🕵️ [sniff] ${req.method} ${req.url}${internal ? " [internal]" : ""}${extra}`);
+      }
+    } catch { /* never let sniffing break a request */ }
+
     // Anti-loop: skip requests from 9Router
     if (req.headers[INTERNAL_REQUEST_HEADER.name] === INTERNAL_REQUEST_HEADER.value) {
       return passthrough(req, res, bodyBuffer);
@@ -341,6 +366,11 @@ const server = https.createServer(sslOptions, async (req, res) => {
 
     const tool = getToolForHost(req.headers.host);
     if (!tool) return passthrough(req, res, bodyBuffer);
+
+    // Anthropic has bespoke routing (native passthrough vs 9r/<combo> vs models-enrich vs
+    // count_tokens) — delegate the whole request to its handler instead of the generic
+    // extractModel→getMappedModel→intercept flow used by the other tools.
+    if (tool === "anthropic") return handlers.anthropic.handle(req, res, bodyBuffer, passthrough);
 
     const patterns = URL_PATTERNS[tool] || [];
     const isChat = patterns.some(p => req.url.includes(p));
@@ -433,3 +463,14 @@ const shutdown = () => {
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 if (process.platform === "win32") process.on("SIGBREAK", shutdown);
+
+// ── Process-level error guards ───────────────────────────────
+// Prevent client disconnect mid-stream (ERR_STREAM_WRITE_AFTER_END) from killing the
+// MITM process. Log and continue — the individual request will fail gracefully, but
+// the server stays alive for the next one.
+process.on("uncaughtException", (e) => {
+  err(`uncaughtException (kept alive): ${e.message} ${e.stack || ""}`);
+});
+process.on("unhandledRejection", (reason) => {
+  err(`unhandledRejection (kept alive): ${reason}`);
+});

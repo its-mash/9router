@@ -57,11 +57,14 @@ async function pipeSSE(routerRes, res, dumper) {
 
   const reader = routerRes.body.getReader();
   const decoder = new TextDecoder();
+  let clientGone = false;
+  res.on("close", () => { clientGone = true; });
   while (true) {
     const { done, value } = await reader.read();
-    if (done) { if (dumper) dumper.end(); res.end(); break; }
+    if (done) { if (dumper) dumper.end(); if (!res.writableEnded) res.end(); break; }
+    if (clientGone) { reader.cancel().catch(() => {}); break; }
     if (dumper) dumper.writeChunk(value);
-    res.write(decoder.decode(value, { stream: true }));
+    try { res.write(decoder.decode(value, { stream: true })); } catch { clientGone = true; reader.cancel().catch(() => {}); break; }
   }
 }
 

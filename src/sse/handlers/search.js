@@ -13,6 +13,36 @@ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo.js";
+import { saveUsageStats, buildRequestDetail } from "open-sse/handlers/chatCore/requestDetail.js";
+import { saveRequestDetail, appendRequestLog } from "@/lib/usageDb.js";
+
+/**
+ * Record a successful web-search request into the usage + request-details store so it
+ * shows in the usage tab (with the upstream request body + cache token usage).
+ */
+function recordSearchUsage({ providerId, data, connectionId, apiKey }) {
+  try {
+    if (!data) return;
+    const u = data.usage || {};
+    const model = data.answer?.model || providerId;
+    const tokens = {
+      prompt_tokens: u.input_tokens ?? 0,
+      completion_tokens: u.output_tokens ?? u.llm_tokens ?? 0,
+      cache_read_input_tokens: u.cache_read_input_tokens,
+      cache_creation_input_tokens: u.cache_creation_input_tokens,
+    };
+    saveUsageStats({ provider: providerId, model, tokens, connectionId, apiKey, endpoint: "/v1/search", label: "SEARCH" });
+    saveRequestDetail(buildRequestDetail({
+      provider: providerId, model, connectionId, tokens,
+      request: { query: data.query, provider: providerId, results: (data.results || []).length },
+      providerRequest: data.providerRequest || null,
+      providerResponse: { results: data.results, answer: data.answer },
+      response: { content: data.answer?.text || `${(data.results || []).length} results`, finish_reason: "stop" },
+      status: "success",
+    }, { endpoint: "/v1/search" })).catch(() => {});
+    appendRequestLog({ provider: providerId, model, connectionId, tokens, status: "200 OK" }).catch(() => {});
+  } catch { /* never break search */ }
+}
 
 /**
  * Handle web search request for the SSE/Next.js server.
@@ -90,6 +120,59 @@ export async function handleSearch(request) {
   return handleSingleProviderSearch(body, providerInput, request, apiKey, settings);
 }
 
+/**
+ * Internal fulfiller for the Claude-Code web_search shim (open-sse/handlers/webSearchShim.js).
+ *
+ * Reuses the full search dispatch — combo fallback + dedicated (exa) and chat-based
+ * (gemini, …) backends with their real credentials — by auto-selecting the user's
+ * configured `webSearch` combo (e.g. "search-combo": gemini → exa), falling back to a
+ * single `gemini` provider if none is configured. Returns the unified result shape
+ * the shim expects: { ok, results, answer }.
+ *
+ * @param {string} query
+ * @param {{maxResults?:number, log?:object}} [opts]
+ */
+export async function runSearchQuery(query, { maxResults = 8, log: logger, target: explicitTarget } = {}) {
+  if (!query || typeof query !== "string" || !query.trim()) return { ok: false, results: [] };
+
+  // Target priority: explicit caller override (MCP picks its own combo) → MITM setting
+  // (a combo name OR a single provider id) → first webSearch-kind combo → single "gemini"
+  // provider. So the search backend is a user choice, configurable in the UI.
+  let target = "gemini";
+  if (explicitTarget && String(explicitTarget).trim()) {
+    target = String(explicitTarget).trim();
+  } else {
+    try {
+      const settings = await getSettings();
+      const chosen = settings?.mitmSearchCombo && String(settings.mitmSearchCombo).trim();
+      if (chosen) {
+        target = chosen;
+      } else {
+        const combos = await getCombos();
+        const ws = (combos || []).find((c) => c && c.kind === "webSearch" && Array.isArray(c.models) && c.models.length);
+        if (ws?.name) target = ws.name;
+      }
+    } catch { /* use fallback */ }
+  }
+
+  const req = new Request("http://localhost/v1/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: target, query: query.trim(), max_results: maxResults }),
+  });
+
+  try {
+    const resp = await handleSearch(req);
+    const data = await resp.json().catch(() => null);
+    const results = Array.isArray(data?.results) ? data.results : [];
+    logger?.info?.("CHAT", `[web-search shim] backend=${target} results=${results.length}`);
+    return { ok: results.length > 0, results, answer: data?.answer?.text || "" };
+  } catch (e) {
+    logger?.warn?.("CHAT", `[web-search shim] search failed: ${e?.message}`);
+    return { ok: false, results: [] };
+  }
+}
+
 async function handleSingleProviderSearch(body, providerInput, request, apiKey, settings) {
   const query = body.query;
   const providerId = resolveProviderId(providerInput);
@@ -139,7 +222,7 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
       credentials: null,
       log
     });
-    if (result.success) return result.response;
+    if (result.success) { recordSearchUsage({ providerId, data: result.data, connectionId: null, apiKey }); return result.response; }
     return result.response;
   }
 
@@ -149,7 +232,12 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
   let lastStatus = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(providerId, excludeConnectionIds);
+    let credentials = await getProviderCredentials(providerId, excludeConnectionIds);
+    // The Haiku/Claude search wrapper ("anthropic") can run on a Claude Code OAuth
+    // connection (provider "claude") when no dedicated "anthropic" connection exists.
+    if (!credentials && providerId === "anthropic") {
+      credentials = await getProviderCredentials("claude", excludeConnectionIds);
+    }
 
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
@@ -189,7 +277,7 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
       }
     });
 
-    if (result.success) return result.response;
+    if (result.success) { recordSearchUsage({ providerId, data: result.data, connectionId: credentials.connectionId, apiKey }); return result.response; }
 
     const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, providerId);
 
