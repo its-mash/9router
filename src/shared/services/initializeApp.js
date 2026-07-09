@@ -13,7 +13,7 @@ import {
   RESTART_COOLDOWN_MS, NETWORK_SETTLE_MS,
   WATCHDOG_INTERVAL_MS, NETWORK_CHECK_INTERVAL_MS, VIRTUAL_IFACE_REGEX,
 } from "@/lib/tunnel";
-import { getMitmStatus, startMitm, loadEncryptedPassword, initDbHooks, restoreToolDNS, removeAllDNSEntriesSync } from "@/mitm/manager";
+import { getMitmStatus, startMitm, loadEncryptedPassword, initDbHooks, restoreToolDNS, removeAllDNSEntriesSync, isSudoPasswordRequired } from "@/mitm/manager";
 import { startQuotaAutoPing } from "@/shared/services/quotaAutoPing";
 import { syncToJson as syncMitmAliasCache } from "@/lib/mitmAliasCache";
 
@@ -105,8 +105,11 @@ async function autoStartMitm() {
     if (mitmStatus.running) return;
 
     const password = await loadEncryptedPassword();
-    if (!password && process.platform !== "win32") {
-      console.log("[InitApp] MITM was enabled but no saved password found, skipping auto-start");
+    // Skip only when a password is genuinely needed but unavailable. When sudo is
+    // passwordless (NOPASSWD sudoers) isSudoPasswordRequired() is false, so we can
+    // auto-start unattended without a stored password.
+    if (!password && process.platform !== "win32" && isSudoPasswordRequired()) {
+      console.log("[InitApp] MITM was enabled but sudo needs a password and none is saved, skipping auto-start");
       return;
     }
 
@@ -114,10 +117,10 @@ async function autoStartMitm() {
     const activeKey = keys.find(k => k.isActive !== false);
 
     console.log("[InitApp] MITM was enabled, auto-starting...");
-    await startMitm(activeKey?.key || "sk_9router", password);
+    await startMitm(activeKey?.key || "sk_9router", password || "");
     console.log("[InitApp] MITM auto-started");
     try {
-      await restoreToolDNS(password);
+      await restoreToolDNS(password || "");
       console.log("[InitApp] DNS restored from saved state");
     } catch (e) {
       console.log("[InitApp] DNS restore failed:", e.message);
