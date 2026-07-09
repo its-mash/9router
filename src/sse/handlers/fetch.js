@@ -15,6 +15,7 @@ import { updateProviderCredentials, checkAndRefreshToken } from "../services/tok
 import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo.js";
 import { buildRequestDetail } from "open-sse/handlers/chatCore/requestDetail.js";
 import { saveRequestDetail, appendRequestLog } from "@/lib/usageDb.js";
+import { assertPublicUrl } from "@/shared/utils/ssrfGuard.js";
 
 /**
  * Record a successful web-fetch into the usage + request-details store (so it shows in the usage tab).
@@ -142,6 +143,14 @@ export async function handleFetch(request) {
   } catch {
     log.warn("FETCH", "Invalid URL", { url: targetUrl });
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid URL format");
+  }
+
+  // SSRF guard: reject internal/private/metadata targets
+  try {
+    assertPublicUrl(targetUrl);
+  } catch (err) {
+    log.warn("FETCH", "Blocked URL", { url: targetUrl });
+    return errorResponse(HTTP_STATUS.BAD_REQUEST, err.message);
   }
 
   // Combo expansion: providerInput may be a combo name → run fallback/round-robin across providers
