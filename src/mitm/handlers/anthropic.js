@@ -147,7 +147,7 @@ function postUsage(rec) {
 }
 
 // Parse Anthropic usage from a passthrough response (SSE or JSON) and record it.
-function recordPassthroughUsage(reqBody, respBuf, respHeaders) {
+function recordPassthroughUsage(reqBody, respBuf, respHeaders, connectionId = null) {
   try {
     const ct = String((respHeaders && (respHeaders["content-type"] || respHeaders["Content-Type"])) || "");
     const text = respBuf ? respBuf.toString("utf8") : "";
@@ -170,11 +170,180 @@ function recordPassthroughUsage(reqBody, respBuf, respHeaders) {
     postUsage({
       provider: "claude",
       model,
+      connectionId,
       tokens: { input_tokens: input, output_tokens: output },
       endpoint: "/v1/messages",
       request: { model, stream: reqBody?.stream !== false },
     });
   } catch { /* never break passthrough */ }
+}
+
+// ── Native account load-balancing (MITM-side auth injection) ───────────────────
+// We do NOT reimplement account selection — 9Router's built-in picker
+// (getProviderCredentials: round-robin / fill-first / priority / preferred, per dashboard
+// settings) lives in the ESM backend, and the MITM is a SEPARATE process, so we reach it over
+// HTTP (mirrors /api/combos, /api/cli-tools/mitm-usage). The endpoint returns the picked
+// account's fresh token; AUTH INJECTION + byte-for-byte forwarding happen here.
+const NATIVE_ROTATE_STATUSES = new Set([401, 403, 429, 529]);
+const MAX_NATIVE_ATTEMPTS = 4;
+
+// Ask the backend's built-in picker for the next active (non-rate-limited) Claude account.
+// `failed` (if set) locks the just-failed account so the picker skips it → rotation.
+function pickClaudeAccount(exclude, model, failed) {
+  return new Promise((resolve) => {
+    const data = JSON.stringify({ exclude, model, failed });
+    const u = new URL(`${ROUTER_BASE}/api/cli-tools/claude-account`);
+    const mod = u.protocol === "https:" ? https : http;
+    const r = mod.request({
+      hostname: u.hostname,
+      port: u.port || (u.protocol === "https:" ? 443 : 80),
+      path: u.pathname,
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-9r-cli-token": cliToken(), "Content-Length": Buffer.byteLength(data) },
+    }, (resp) => {
+      let buf = "";
+      resp.on("data", (c) => (buf += c));
+      resp.on("end", () => { try { resolve(JSON.parse(buf)); } catch { resolve(null); } });
+    });
+    r.on("error", () => resolve(null));
+    r.setTimeout(8000, () => { r.destroy(); resolve(null); });
+    r.write(data);
+    r.end();
+  });
+}
+
+// Forward the ORIGINAL body byte-for-byte to the real api.anthropic.com (DNS-bypassing the
+// hosts MITM redirect), swapping ONLY the auth header to the picked account. Resolves with the
+// upstream response stream so the caller can inspect status (rotate on 429) before piping.
+function postRealAnthropic(req, bodyBuffer, acct) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const ip = await realIp("api.anthropic.com");
+      const headers = {};
+      for (const [k, v] of Object.entries(req.headers)) {
+        const lk = k.toLowerCase();
+        if (["host", "content-length", "connection", "accept-encoding", "authorization", "x-api-key"].includes(lk)) continue;
+        headers[k] = v;
+      }
+      headers.host = "api.anthropic.com";
+      headers["content-length"] = Buffer.byteLength(bodyBuffer);
+      if (acct.authType === "x-api-key") {
+        headers["x-api-key"] = acct.token;
+      } else {
+        headers["authorization"] = `Bearer ${acct.token}`;
+        // OAuth (Max) accounts require the oauth beta flag; merge without dropping client flags.
+        const flags = new Set(String(headers["anthropic-beta"] || "").split(",").map((s) => s.trim()).filter(Boolean));
+        flags.add("oauth-2025-04-20");
+        headers["anthropic-beta"] = Array.from(flags).join(",");
+      }
+      const r = https.request(
+        { host: ip, servername: "api.anthropic.com", port: 443, path: req.url, method: "POST", headers, rejectUnauthorized: false },
+        (resp) => resolve(resp)
+      );
+      r.on("error", reject);
+      r.setTimeout(600000, () => r.destroy(new Error("anthropic upstream timeout")));
+      r.write(bodyBuffer);
+      r.end();
+    } catch (e) { reject(e); }
+  });
+}
+
+// Stream an accepted upstream response back to the client + tee usage (attributed to acct).
+function pipeUpstreamToClient(upstream, res, body, connectionId) {
+  const headers = {};
+  for (const [k, v] of Object.entries(upstream.headers || {})) {
+    const lk = k.toLowerCase();
+    if (lk === "connection" || lk === "transfer-encoding" || lk === "keep-alive") continue;
+    headers[k] = v;
+  }
+  res.writeHead(upstream.statusCode || 200, headers);
+  const chunks = [];
+  let clientGone = false;
+  res.on("close", () => { clientGone = true; });
+  upstream.on("data", (c) => {
+    chunks.push(c);
+    if (!clientGone) { try { res.write(c); } catch { clientGone = true; } }
+  });
+  upstream.on("end", () => {
+    if (!res.writableEnded) res.end();
+    try { recordPassthroughUsage(body, Buffer.concat(chunks), upstream.headers, connectionId); } catch { /* ignore */ }
+  });
+  upstream.on("error", () => { if (!res.writableEnded) res.end(); });
+}
+
+function parseRetryAfterMs(headers) {
+  const ra = headers && (headers["retry-after"] || headers["Retry-After"]);
+  if (!ra) return null;
+  const secs = parseInt(ra, 10);
+  return Number.isFinite(secs) ? Date.now() + secs * 1000 : null;
+}
+
+// All connected accounts limited/unavailable → surface a clean rate-limit error to Claude Code.
+//
+// Claude Code (and the Anthropic SDK) identify a rate limit by the HTTP **429 status** plus the
+// body `error.type: "rate_limit_error"` — NOT by an in-stream SSE `event: error`. A request that
+// is rate-limited BEFORE the stream starts gets a real 429 from api.anthropic.com even when
+// `stream:true` was requested (the SDK checks the response status before it ever parses SSE).
+// So we ALWAYS return a 429 JSON here, regardless of the client's stream flag. Returning
+// `200 + event:error` (the old streaming path) made the SDK begin a stream and then hit a
+// mid-stream error → surfaced as a generic stream/API error, not a RateLimitError → Claude Code
+// showed "a different error" instead of the usage-limit/backoff flow.
+function sendNativeExhausted(res, body, info) {
+  const human = info && info.retryAfterHuman ? ` (retry in ${info.retryAfterHuman})` : "";
+  const message = `All connected Claude accounts are rate-limited${human}.`;
+  log(`🚫 native ${body?.model} → all accounts exhausted${human} → 429 rate_limit_error`);
+  const headers = { "Content-Type": "application/json" };
+  // retry-after (seconds) + the unified subscription headers Claude Code reads to show the
+  // reset window. info.retryAfter is the picker's seconds-until-reset; guard against ms/epoch.
+  const secs = info && Number(info.retryAfter);
+  if (Number.isFinite(secs) && secs > 0 && secs < 100000) {
+    headers["retry-after"] = String(Math.ceil(secs));
+    headers["anthropic-ratelimit-unified-status"] = "rejected";
+    headers["anthropic-ratelimit-unified-reset"] = String(Math.floor(Date.now() / 1000) + Math.ceil(secs));
+  }
+  if (!res.headersSent) res.writeHead(429, headers);
+  res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message } }));
+}
+
+// Native Anthropic load-balance loop: pick (built-in picker) → inject auth → forward
+// byte-for-byte → rotate on rate-limit. Falls back to client-token passthrough when NO
+// managed accounts are connected (safe-by-default).
+async function nativeWithAccountRotation(req, res, bodyBuffer, body, passthrough) {
+  const exclude = [];
+  let failed = null;
+  let lastInfo = null;
+  for (let attempt = 0; attempt < MAX_NATIVE_ATTEMPTS; attempt++) {
+    const acct = await pickClaudeAccount(exclude, body.model, failed);
+    failed = null;
+    if (!acct || acct.none) {
+      if (attempt === 0 && (!acct || acct.reason === "no_accounts" || acct.reason === "no_token")) {
+        log(`🌐 native ${body.model} → no managed Claude accounts; passthrough with client token`);
+        return passthrough(req, res, bodyBuffer, (respBuf, respHeaders) => recordPassthroughUsage(body, respBuf, respHeaders));
+      }
+      return sendNativeExhausted(res, body, acct || lastInfo);
+    }
+    lastInfo = acct;
+    let upstream;
+    try {
+      upstream = await postRealAnthropic(req, bodyBuffer, acct);
+    } catch (e) {
+      err(`[anthropic] native upstream error via ${acct.connectionName}: ${e.message}`);
+      exclude.push(acct.connectionId);
+      failed = { connectionId: acct.connectionId, status: 502, error: e.message };
+      continue;
+    }
+    if (NATIVE_ROTATE_STATUSES.has(upstream.statusCode)) {
+      log(`⚠ native ${body.model} via ${acct.connectionName} → ${upstream.statusCode}, rotating`);
+      const resetsAtMs = parseRetryAfterMs(upstream.headers);
+      upstream.resume(); // drain + discard the error body
+      exclude.push(acct.connectionId);
+      failed = { connectionId: acct.connectionId, status: upstream.statusCode, resetsAtMs };
+      continue;
+    }
+    log(`✅ native ${body.model} via ${acct.connectionName} (${upstream.statusCode})`);
+    return pipeUpstreamToClient(upstream, res, body, acct.connectionId);
+  }
+  return sendNativeExhausted(res, body, lastInfo);
 }
 
 // GET /v1/models → native Anthropic list + 9router combos (as 9r/<combo>).
@@ -260,13 +429,14 @@ async function handle(req, res, bodyBuffer, passthrough) {
         const routerRes = await fetchRouter(body, "/v1/messages", req.headers);
         return await pipeSSE(routerRes, res);
       }
-      // Native Anthropic model → pure passthrough (their token, their limits, no fallback).
-      // Tee the response to record usage so native ("direct") traffic shows in the usage tab.
+      // Native Anthropic model → load-balance across the CONNECTED Claude accounts using
+      // 9Router's built-in picker; inject ONLY the auth header + forward the body byte-for-byte,
+      // rotating on 429/401/403/529. Falls back to client-token passthrough when none connected.
       if (tf.any) {
         const kinds = [tf.search && "web_search", tf.fetch && "web_fetch"].filter(Boolean).join("+");
-        log(`🌐 native ${model} passthrough — ${kinds} served by Anthropic (not shimmed)`);
+        log(`🌐 native ${model} — ${kinds} served by Anthropic (not shimmed)`);
       }
-      return passthrough(req, res, bodyBuffer, (respBuf, respHeaders) => recordPassthroughUsage(body, respBuf, respHeaders));
+      return await nativeWithAccountRotation(req, res, bodyBuffer, body, passthrough);
     }
     // Anything else on this host (oauth, usage, etc.) → passthrough
     return passthrough(req, res, bodyBuffer);
