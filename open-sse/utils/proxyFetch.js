@@ -99,6 +99,13 @@ async function tryGotScrapingFetch(url, options) {
 
 // DNS cache — use Map to avoid prototype pollution via malformed hostnames
 const DNS_CACHE = new Map();
+// Hosts the TLS-MITM intercepts (src/mitm/config.js TARGET_HOSTS) must ALSO be listed here so
+// 9Router's OWN backend calls resolve the real IP and skip the /etc/hosts redirect — otherwise
+// they hit the local MITM server, whose self-signed cert this Node process doesn't trust
+// (NODE_EXTRA_CA_CERTS is set only for GUI apps on mac/win, never this server / never Linux),
+// and every call fails at the TLS handshake. `api.anthropic.com` is intercepted for the Claude
+// passthrough feature; without it here, new Claude-account OAuth login, token refresh, and the
+// quota tracker all break whenever Claude intercept is on.
 const MITM_BYPASS_HOSTS = [
   "cloudcode-pa.googleapis.com",
   "daily-cloudcode-pa.googleapis.com",
@@ -106,6 +113,7 @@ const MITM_BYPASS_HOSTS = [
   "q.us-east-1.amazonaws.com",
   "codewhisperer.us-east-1.amazonaws.com",
   "api2.cursor.sh",
+  "api.anthropic.com",
 ];
 const GOOGLE_DNS_SERVERS = ["8.8.8.8", "8.8.4.4"];
 const HTTPS_PORT = 443;
